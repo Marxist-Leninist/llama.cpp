@@ -227,6 +227,11 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_q1_0_g128,
         .vec_dot                  = ggml_vec_dot_q1_0_g128_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
+        // nrows=1: the nrc=2 x86 kernel used s[bs/sizeof(float)] but the dispatch
+        // expects MMLA-style s[bs] (2 weight rows × 2 activation cols). This caused
+        // corrupt prompt-eval results. Generation (ne11=1) was unaffected since the
+        // ne11%2!=0 guard forced nrc=1. Kept at 1 until a proper 2×2 tile kernel
+        // is written.
         .nrows                    = 1,
     },
     [GGML_TYPE_Q4_0] = {
@@ -1185,12 +1190,75 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     assert(ne12 % ne02 == 0);
     assert(ne13 % ne03 == 0);
 
-    // COM6-inspired block-tiling: larger blocks for Q1_0_g128 (1-bit weights are tiny,
-    // so we can fit more rows in L1). Prefetch next weight block while processing current.
-    const int64_t blck_0 = (type == GGML_TYPE_Q1_0_g128) ? 64 : 16;
-    const int64_t blck_1 = 16;
-
     const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
+
+#if defined(__AVX2__)
+    // Q1_0_g128 fast path: nrc=4 kernel processes 4 weight rows per call,
+    // loading Q8 activations once per quad (~60% activation bandwidth savings).
+    // Write directly to dst (no tmp buffer needed).
+    if (type == GGML_TYPE_Q1_0_g128) {
+        // Resolve src0_row once: in mul_mat the broadcast dims (i02,i03)
+        // are uniform across ir1 in this thread's range for typical LLM
+        // matmuls (ne12==ne02, ne13==ne03), so we hoist it out. We still
+        // recompute per-ir1 to be safe when broadcasting is in effect.
+        const int64_t ne1xne12 = ne12 * ne1;
+
+        // GEPP-style outer tile over weight rows: load 4 weight rows
+        // (~2.3 KB at K=4096) and reuse them across ALL activation columns
+        // before moving on. This turns weight bandwidth from O(ne01*ne11)
+        // back down to O(ne01) for prompt processing, where the previous
+        // column-outer order evicted weights between columns.
+        int64_t ir0 = ir0_start;
+        for (; ir0 + 3 < ir0_end; ir0 += 4) {
+            for (int64_t ir1 = ir1_start; ir1 < ir1_end; ++ir1) {
+                const int64_t i13 = (ir1 / ne1xne12);
+                const int64_t i12 = (ir1 - i13 * ne1xne12) / ne1;
+                const int64_t i11 = (ir1 - i13 * ne1xne12 - i12 * ne1);
+                const int64_t i03 = i13 / r3;
+                const int64_t i02 = i12 / r2;
+                const char * src0_row = (const char*)src0->data + (i02 * nb02 + i03 * nb03);
+                const char * src1_col = (const char*)wdata +
+                    (src1_cont || src1->type != vec_dot_type
+                        ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
+                        : (i11 * nb11 + i12 * nb12 + i13 * nb13));
+                float * dst_col = (float*)((char*)dst->data + (i11 * nb1 + i12 * nb2 + i13 * nb3));
+                vec_dot(ne00, &dst_col[ir0], sizeof(float),
+                        src0_row + ir0 * nb01, nb01,
+                        src1_col, 0, 4);
+            }
+        }
+        // Remainder rows: fall back to column-outer order (small tail)
+        for (int64_t ir1 = ir1_start; ir1 < ir1_end; ++ir1) {
+            const int64_t i13 = (ir1 / ne1xne12);
+            const int64_t i12 = (ir1 - i13 * ne1xne12) / ne1;
+            const int64_t i11 = (ir1 - i13 * ne1xne12 - i12 * ne1);
+            const int64_t i03 = i13 / r3;
+            const int64_t i02 = i12 / r2;
+            const char * src0_row = (const char*)src0->data + (i02 * nb02 + i03 * nb03);
+            const char * src1_col = (const char*)wdata +
+                (src1_cont || src1->type != vec_dot_type
+                    ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
+                    : (i11 * nb11 + i12 * nb12 + i13 * nb13));
+            float * dst_col = (float*)((char*)dst->data + (i11 * nb1 + i12 * nb2 + i13 * nb3));
+            int64_t ir0t = ir0;
+            for (; ir0t + 1 < ir0_end; ir0t += 2) {
+                vec_dot(ne00, &dst_col[ir0t], sizeof(float),
+                        src0_row + ir0t * nb01, nb01,
+                        src1_col, 0, 2);
+            }
+            if (ir0t < ir0_end) {
+                vec_dot(ne00, &dst_col[ir0t], 0,
+                        src0_row + ir0t * nb01, 0,
+                        src1_col, 0, 1);
+            }
+        }
+        return;
+    }
+#endif
+
+    // Generic path for all other quant types
+    const int64_t blck_0 = 16;
+    const int64_t blck_1 = 16;
 
     // attempt to reduce false-sharing (does not seem to make a difference)
     // Size: blck_0 * 2 (accounting for mmla kernels that compute 2 rows at once)
@@ -1213,31 +1281,18 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
                 const char * src0_row = (const char*)src0->data + (0 + i02 * nb02 + i03 * nb03);
 
-                // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
-                //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
-                //       the original src1 data pointer, so we should index using the indices directly
-                // TODO: this is a bit of a hack, we should probably have a better way to handle this
                 const char * src1_col = (const char*)wdata +
                     (src1_cont || src1->type != vec_dot_type
                         ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
                         : (i11 * nb11 + i12 * nb12 + i13 * nb13));
                 float * dst_col = (float*)((char*)dst->data + (i1 * nb1 + i2 * nb2 + i3 * nb3));
 
-                //for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
-                //    vec_dot(ne00, &dst_col[ir0], src0_row + ir0*nb01, src1_col);
-                //}
-
-                // COM6-inspired: prefetch next weight rows while computing current ones.
-                const int64_t ir0_max = MIN(iir0 + blck_0, ir0_end);
-                for (int64_t ir0 = iir0; ir0 < ir0_max; ir0 += num_rows_per_vec_dot) {
-                    if (ir0 + 4 * num_rows_per_vec_dot < ir0_max) {
-                        __builtin_prefetch(src0_row + (ir0 + 4 * num_rows_per_vec_dot) * nb01, 0, 1);
-                    }
+                for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
                     vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
                 }
 
                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
-                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (ir0_max - iir0) * sizeof(float));
+                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
                 }
             }
         }
