@@ -1203,12 +1203,35 @@ static void ggml_compute_forward_mul_mat_one_chunk(
         // recompute per-ir1 to be safe when broadcasting is in effect.
         const int64_t ne1xne12 = ne12 * ne1;
 
-        // GEPP-style outer tile over weight rows: load 4 weight rows
-        // (~2.3 KB at K=4096) and reuse them across ALL activation columns
-        // before moving on. This turns weight bandwidth from O(ne01*ne11)
-        // back down to O(ne01) for prompt processing, where the previous
-        // column-outer order evicted weights between columns.
+        // GEPP-style outer tile: process 16 weight rows per outer iteration
+        // (4 × nrc=4 calls), prefetching the next group to hide DRAM latency.
+        // Each Q1_0_g128 row at K=4096 is 576 bytes; 16 rows = 9.2 KB (fits L1d).
         int64_t ir0 = ir0_start;
+        for (; ir0 + 15 < ir0_end; ir0 += 16) {
+            for (int64_t ir1 = ir1_start; ir1 < ir1_end; ++ir1) {
+                const int64_t i13 = (ir1 / ne1xne12);
+                const int64_t i12 = (ir1 - i13 * ne1xne12) / ne1;
+                const int64_t i11 = (ir1 - i13 * ne1xne12 - i12 * ne1);
+                const int64_t i03 = i13 / r3;
+                const int64_t i02 = i12 / r2;
+                const char * src0_row = (const char*)src0->data + (i02 * nb02 + i03 * nb03);
+                const char * src1_col = (const char*)wdata +
+                    (src1_cont || src1->type != vec_dot_type
+                        ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
+                        : (i11 * nb11 + i12 * nb12 + i13 * nb13));
+                float * dst_col = (float*)((char*)dst->data + (i11 * nb1 + i12 * nb2 + i13 * nb3));
+                // Prefetch next 16-row tile's first cache lines
+                if (ir0 + 19 < ir0_end) {
+                    _mm_prefetch(src0_row + (ir0 + 16) * nb01, _MM_HINT_T1);
+                    _mm_prefetch(src0_row + (ir0 + 18) * nb01, _MM_HINT_T1);
+                }
+                vec_dot(ne00, &dst_col[ir0],    sizeof(float), src0_row + ir0       * nb01, nb01, src1_col, 0, 4);
+                vec_dot(ne00, &dst_col[ir0+4],  sizeof(float), src0_row + (ir0 + 4) * nb01, nb01, src1_col, 0, 4);
+                vec_dot(ne00, &dst_col[ir0+8],  sizeof(float), src0_row + (ir0 + 8) * nb01, nb01, src1_col, 0, 4);
+                vec_dot(ne00, &dst_col[ir0+12], sizeof(float), src0_row + (ir0 +12) * nb01, nb01, src1_col, 0, 4);
+            }
+        }
+        // Remaining rows in groups of 4
         for (; ir0 + 3 < ir0_end; ir0 += 4) {
             for (int64_t ir1 = ir1_start; ir1 < ir1_end; ++ir1) {
                 const int64_t i13 = (ir1 / ne1xne12);

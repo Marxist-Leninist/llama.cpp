@@ -653,99 +653,172 @@ void ggml_vec_dot_q1_0_g128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, cons
     const int nb = n / qk;
 
     assert(n % qk == 0);
-    assert(nrc == 1);
-    UNUSED(nrc);
-    UNUSED(bx);
     UNUSED(by);
-    UNUSED(bs);
-
-    const block_q1_0_g128 * GGML_RESTRICT x = vx;
-    const block_q8_0 * GGML_RESTRICT y = vy;
-
-    float sumf = 0;
 
 #if defined(__AVX2__)
-    // AVX2: process 32 Q8_0 values per sub-block in two 16-element passes.
-    // Sign-extend int8->int16, expand 1-bit weights to masks, blend to negate,
-    // then madd->fma accumulation.
-    const __m256i ones_16 = _mm256_set1_epi16(1);
-    const __m256i bmask = _mm256_setr_epi16(
-        1<<0,  1<<1,  1<<2,  1<<3,  1<<4,  1<<5,  1<<6,  1<<7,
-        1<<8,  1<<9,  1<<10, 1<<11, 1<<12, 1<<13, 1<<14, (short)(1<<15));
-    __m256 acc = _mm256_setzero_ps();
+    // Maddubs kernel: uses the identity dot(w, a) = 2·Σ(a where bit=1) − Σ(a)
+    // for 1-bit weights w ∈ {-1,+1} encoded as bits b ∈ {0,1} where w = 2b−1.
+    //
+    // Bit expansion: broadcast uint32 weight bits → shuffle each byte to its
+    // 8-byte group → AND with per-position bit test → clamp to 0/1 with min.
+    // Then maddubs(selector, activations) gives masked pair-sums, and
+    // 2·masked − sum_all gives the signed dot product in int16 pairs.
+    //
+    // Multi-row (nrc>1): activation data loaded once per sub-block, reused
+    // across all weight rows. Saves ~75% activation bandwidth for nrc=4.
 
-    for (int ib = 0; ib < nb; ++ib) {
-        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
-        __m256 acc_block = _mm256_setzero_ps();
+    const __m256i shuf_mask = _mm256_setr_epi8(
+        0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1,
+        2,2,2,2,2,2,2,2, 3,3,3,3,3,3,3,3);
+    const __m256i bit_test  = _mm256_set1_epi64x((long long)0x8040201008040201LL);
+    const __m256i ones_byte = _mm256_set1_epi8(1);
+    const __m256i ones_16   = _mm256_set1_epi16(1);
 
-        for (int k = 0; k < 4; k++) {
-            const float d1 = GGML_CPU_FP16_TO_FP32(y[ib*4 + k].d);
-            const __m256i y_bytes = _mm256_loadu_si256((const __m256i *)y[ib*4 + k].qs);
+    // Macro: compute one row's contribution for one sub-block.
+    // Expects ab (activation bytes) and sa (sum-all pairs) in scope.
+#define Q1G128_DOT_ROW(xptr, ib_idx, k_idx, ab, sa, scale, acc_r) \
+    do { \
+        uint32_t _bits; \
+        memcpy(&_bits, &(xptr)[(ib_idx)].qs[(k_idx) * 4], sizeof(_bits)); \
+        const __m256i _bexp = _mm256_shuffle_epi8(_mm256_set1_epi32((int)_bits), shuf_mask); \
+        const __m256i _sel  = _mm256_min_epu8(_mm256_and_si256(_bexp, bit_test), ones_byte); \
+        const __m256i _ps   = _mm256_maddubs_epi16(_sel, (ab)); \
+        const __m256i _dp   = _mm256_sub_epi16(_mm256_slli_epi16(_ps, 1), (sa)); \
+        const __m256i _d32  = _mm256_madd_epi16(_dp, ones_16); \
+        (acc_r) = _mm256_fmadd_ps(_mm256_set1_ps(scale), _mm256_cvtepi32_ps(_d32), (acc_r)); \
+    } while (0)
 
-            uint32_t bits;
-            memcpy(&bits, &x[ib].qs[k * 4], sizeof(bits));
+    // Horizontal reduction: __m256 → scalar float
+#define Q1G128_HREDUCE(acc_r) do { \
+        const __m128 _h = _mm_add_ps(_mm256_extractf128_ps((acc_r), 0), \
+                                      _mm256_extractf128_ps((acc_r), 1)); \
+        const __m128 _q = _mm_add_ps(_h, _mm_movehl_ps(_h, _h)); \
+        _hresult = _mm_cvtss_f32(_mm_add_ss(_q, _mm_movehdup_ps(_q))); \
+    } while (0)
 
-            // Lower 16 elements: sign-extend int8->int16, apply sign from weight bits
-            const __m256i y_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(y_bytes));
-            const __m256i neg_lo = _mm256_sub_epi16(_mm256_setzero_si256(), y_lo);
-            const __m256i mask_lo = _mm256_cmpeq_epi16(
-                _mm256_and_si256(_mm256_set1_epi16((short)(bits & 0xFFFF)), bmask), bmask);
-            const __m256i signed_lo = _mm256_blendv_epi8(neg_lo, y_lo, mask_lo);
+    if (nrc == 1) {
+        // Single-row path: no multi-row overhead
+        UNUSED(bx); UNUSED(bs);
+        const block_q1_0_g128 * GGML_RESTRICT x = (const block_q1_0_g128 *)vx;
+        const block_q8_0 * GGML_RESTRICT y = (const block_q8_0 *)vy;
 
-            // Upper 16 elements
-            const __m256i y_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(y_bytes, 1));
-            const __m256i neg_hi = _mm256_sub_epi16(_mm256_setzero_si256(), y_hi);
-            const __m256i mask_hi = _mm256_cmpeq_epi16(
-                _mm256_and_si256(_mm256_set1_epi16((short)(bits >> 16)), bmask), bmask);
-            const __m256i signed_hi = _mm256_blendv_epi8(neg_hi, y_hi, mask_hi);
-
-            // Pair-wise sum int16->int32, combine halves, convert to float, FMA
-            const __m256i sum_32 = _mm256_add_epi32(
-                _mm256_madd_epi16(signed_lo, ones_16),
-                _mm256_madd_epi16(signed_hi, ones_16));
-            acc_block = _mm256_fmadd_ps(_mm256_set1_ps(d1),
-                                         _mm256_cvtepi32_ps(sum_32), acc_block);
+        __m256 acc = _mm256_setzero_ps();
+        for (int ib = 0; ib < nb; ++ib) {
+            const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+            for (int k = 0; k < 4; k++) {
+                const float d1 = GGML_CPU_FP16_TO_FP32(y[ib*4 + k].d);
+                const __m256i ab = _mm256_loadu_si256((const __m256i *)y[ib*4 + k].qs);
+                const __m256i sa = _mm256_maddubs_epi16(ones_byte, ab);
+                Q1G128_DOT_ROW(x, ib, k, ab, sa, d0 * d1, acc);
+            }
         }
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(d0), acc_block, acc);
+        float _hresult;
+        Q1G128_HREDUCE(acc);
+        *s = _hresult;
+
+    } else if (nrc == 4) {
+        // 4-row path: load activation once, compute 4 dot products.
+        const block_q1_0_g128 * GGML_RESTRICT x0 = (const block_q1_0_g128 *)vx;
+        const block_q1_0_g128 * GGML_RESTRICT x1 = (const block_q1_0_g128 *)((const char *)vx + bx);
+        const block_q1_0_g128 * GGML_RESTRICT x2 = (const block_q1_0_g128 *)((const char *)vx + 2*bx);
+        const block_q1_0_g128 * GGML_RESTRICT x3 = (const block_q1_0_g128 *)((const char *)vx + 3*bx);
+        const block_q8_0 * GGML_RESTRICT y = (const block_q8_0 *)vy;
+
+        __m256 a0 = _mm256_setzero_ps();
+        __m256 a1 = _mm256_setzero_ps();
+        __m256 a2 = _mm256_setzero_ps();
+        __m256 a3 = _mm256_setzero_ps();
+
+        for (int ib = 0; ib < nb; ++ib) {
+            const float d0_0 = GGML_CPU_FP16_TO_FP32(x0[ib].d);
+            const float d0_1 = GGML_CPU_FP16_TO_FP32(x1[ib].d);
+            const float d0_2 = GGML_CPU_FP16_TO_FP32(x2[ib].d);
+            const float d0_3 = GGML_CPU_FP16_TO_FP32(x3[ib].d);
+
+            for (int k = 0; k < 4; k++) {
+                const float d1 = GGML_CPU_FP16_TO_FP32(y[ib*4 + k].d);
+                const __m256i ab = _mm256_loadu_si256((const __m256i *)y[ib*4 + k].qs);
+                const __m256i sa = _mm256_maddubs_epi16(ones_byte, ab);
+
+                Q1G128_DOT_ROW(x0, ib, k, ab, sa, d0_0 * d1, a0);
+                Q1G128_DOT_ROW(x1, ib, k, ab, sa, d0_1 * d1, a1);
+                Q1G128_DOT_ROW(x2, ib, k, ab, sa, d0_2 * d1, a2);
+                Q1G128_DOT_ROW(x3, ib, k, ab, sa, d0_3 * d1, a3);
+            }
+        }
+
+        float _hresult;
+        Q1G128_HREDUCE(a0); *(float *)((char *)s + 0*bs) = _hresult;
+        Q1G128_HREDUCE(a1); *(float *)((char *)s + 1*bs) = _hresult;
+        Q1G128_HREDUCE(a2); *(float *)((char *)s + 2*bs) = _hresult;
+        Q1G128_HREDUCE(a3); *(float *)((char *)s + 3*bs) = _hresult;
+
+    } else {
+        // Generic multi-row path for nrc=2,3
+        assert(nrc >= 2 && nrc <= 4);
+        const block_q8_0 * GGML_RESTRICT y = (const block_q8_0 *)vy;
+
+        const block_q1_0_g128 * GGML_RESTRICT xr[4];
+        __m256 acc_r[4];
+        for (int r = 0; r < nrc; r++) {
+            xr[r] = (const block_q1_0_g128 *)((const char *)vx + r * bx);
+            acc_r[r] = _mm256_setzero_ps();
+        }
+
+        for (int ib = 0; ib < nb; ++ib) {
+            float d0_r[4];
+            for (int r = 0; r < nrc; r++) {
+                d0_r[r] = GGML_CPU_FP16_TO_FP32(xr[r][ib].d);
+            }
+
+            for (int k = 0; k < 4; k++) {
+                const float d1 = GGML_CPU_FP16_TO_FP32(y[ib*4 + k].d);
+                const __m256i ab = _mm256_loadu_si256((const __m256i *)y[ib*4 + k].qs);
+                const __m256i sa = _mm256_maddubs_epi16(ones_byte, ab);
+
+                for (int r = 0; r < nrc; r++) {
+                    Q1G128_DOT_ROW(xr[r], ib, k, ab, sa, d0_r[r] * d1, acc_r[r]);
+                }
+            }
+        }
+
+        float _hresult;
+        for (int r = 0; r < nrc; r++) {
+            Q1G128_HREDUCE(acc_r[r]);
+            *(float *)((char *)s + r * bs) = _hresult;
+        }
     }
-    // Horizontal reduction: 256 -> 128 -> scalar
-    {
-        const __m128 h = _mm_add_ps(_mm256_extractf128_ps(acc, 0),
-                                     _mm256_extractf128_ps(acc, 1));
-        const __m128 q = _mm_add_ps(h, _mm_movehl_ps(h, h));
-        *s = _mm_cvtss_f32(_mm_add_ss(q, _mm_movehdup_ps(q)));
-    }
+
+#undef Q1G128_DOT_ROW
+#undef Q1G128_HREDUCE
+
 #else
-    // Scalar fallback
+    // Scalar fallback (nrc=1 only, multi-row handled by dispatch calling nrc=1)
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(bs);
+
+    const block_q1_0_g128 * GGML_RESTRICT x = (const block_q1_0_g128 *)vx;
+    const block_q8_0 * GGML_RESTRICT y = (const block_q8_0 *)vy;
+
+    float sumf = 0;
     for (int ib = 0; ib < nb; ++ib) {
         const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
-        
         float sumi = 0;
-        
-        // Process 4 Q8_0 blocks (4 * 32 = 128 elements)
         for (int k = 0; k < 4; k++) {
             const float d1 = GGML_CPU_FP16_TO_FP32(y[ib*4 + k].d);
-            
             int sumi_block = 0;
-            
             for (int j = 0; j < QK8_0; j++) {
                 const int bit_index = k * QK8_0 + j;
                 const int byte_index = bit_index / 8;
                 const int bit_offset = bit_index % 8;
-                
-                // Extract bit: 1 = +1, 0 = -1
                 const int xi = ((x[ib].qs[byte_index] >> bit_offset) & 1) ? 1 : -1;
                 const int yi = y[ib*4 + k].qs[j];
-                
                 sumi_block += xi * yi;
             }
-            
             sumi += d1 * sumi_block;
         }
-        
         sumf += d0 * sumi;
     }
-
     *s = sumf;
 #endif
 }
